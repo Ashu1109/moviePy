@@ -29,38 +29,34 @@ class VideoRequest(BaseModel):
     audio_link: HttpUrl
     max_duration: int = 600  # 10 minutes in seconds
 
-from fastapi import UploadFile, Form
-import json
+from fastapi import Body
 
 @app.post("/combine-videos")
-async def combine_videos(
-    video_links: str = Form(...),
-    max_duration: int = Form(600),
-    audio: UploadFile = File(...),
-    background_tasks: BackgroundTasks = None
-):
-    # Parse video_links from JSON string
-    try:
-        video_links_list = json.loads(video_links)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid video_links format: {str(e)}")
-
-    # Save uploaded audio file to temp directory
+async def combine_videos(request: VideoRequest, background_tasks: BackgroundTasks):
+    # Generate a unique ID for this request
     job_id = str(uuid.uuid4())
     output_path = os.path.join(OUTPUT_DIR, f"{job_id}.mp4")
-    audio_path = os.path.join(TEMP_DIR, f"{job_id}_audio_{audio.filename}")
-    with open(audio_path, "wb") as f:
-        f.write(await audio.read())
+    audio_temp_path = os.path.join(TEMP_DIR, f"{job_id}_audio.mp3")
+
+    # Download the audio file from the provided link
+    try:
+        response = requests.get(request.audio_link, stream=True)
+        response.raise_for_status()
+        with open(audio_temp_path, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                f.write(chunk)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to download audio: {str(e)}")
 
     try:
         process_videos(
-            video_links_list,
-            audio_path,
+            request.video_links,
+            audio_temp_path,
             output_path,
-            max_duration
+            request.max_duration
         )
         background_tasks.add_task(os.remove, output_path)
-        background_tasks.add_task(os.remove, audio_path)
+        background_tasks.add_task(os.remove, audio_temp_path)
         return FileResponse(
             path=output_path,
             filename=f"combined_video_{job_id}.mp4",
@@ -72,9 +68,9 @@ async def combine_videos(
                 os.remove(output_path)
             except:
                 pass
-        if os.path.exists(audio_path):
+        if os.path.exists(audio_temp_path):
             try:
-                os.remove(audio_path)
+                os.remove(audio_temp_path)
             except:
                 pass
         raise HTTPException(status_code=500, detail=str(e))
@@ -114,8 +110,8 @@ def process_videos(video_links: List[str], audio_path: str, output_path: str, ma
         video_files = [download_file(url, temp_dir) for url in video_links]
         downloaded_files.extend(video_files)
         
-        # Use uploaded audio file
-        logger.info(f"Using uploaded audio file: {audio_path}")
+        # Use downloaded audio file
+        logger.info(f"Using downloaded audio file: {audio_path}")
         audio = AudioFileClip(audio_path)
         
         # Load video clips
@@ -149,7 +145,7 @@ def process_videos(video_links: List[str], audio_path: str, output_path: str, ma
         
         # Load audio file
         logger.info("Adding audio track...")
-        audio = AudioFileClip(audio_file)
+        audio = AudioFileClip(audio_path)
         
         # Loop audio if it's shorter than the video
         if audio.duration < final_clip.duration:
