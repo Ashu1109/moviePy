@@ -2,11 +2,11 @@ import os
 import uuid
 import shutil
 import requests
-from typing import List
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Response, File
+from typing import List, Optional
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Response, File, UploadFile, Form
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, HttpUrl
-from moviepy.editor import VideoFileClip, concatenate_videoclips, AudioFileClip, CompositeVideoClip
+from moviepy.editor import VideoFileClip, concatenate_videoclips, AudioFileClip, CompositeVideoClip, CompositeAudioClip
 import tempfile
 import logging
 
@@ -99,8 +99,16 @@ def download_file(url, directory: str) -> str:
         logger.error(f"Error downloading file from {url}: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error downloading file: {str(e)}")
 
-def process_videos(video_links: List[str], audio_path: str, output_path: str, max_duration: int = 600):
-    """Process videos and audio to create a combined video with a maximum duration."""
+def process_videos(video_links: List[str], audio_path: str, output_path: str, max_duration: int = 600, narration_path: Optional[str] = None):
+    """Process videos and audio to create a combined video with a maximum duration.
+    
+    Args:
+        video_links: List of URLs to download videos from
+        audio_path: Path to the background audio file
+        output_path: Path where the output video will be saved
+        max_duration: Maximum duration of the output video in seconds
+        narration_path: Optional path to a narration audio file
+    """
     temp_dir = tempfile.mkdtemp(dir=TEMP_DIR)
     downloaded_files = []
     
@@ -110,13 +118,9 @@ def process_videos(video_links: List[str], audio_path: str, output_path: str, ma
         video_files = [download_file(url, temp_dir) for url in video_links]
         downloaded_files.extend(video_files)
         
-        # Use downloaded audio file
-        logger.info(f"Using downloaded audio file: {audio_path}")
-        audio = AudioFileClip(audio_path)
-        
         # Load video clips
         logger.info("Loading video clips...")
-        clips = [VideoFileClip(f) for f in video_files]
+        clips = [VideoFileClip(file) for file in video_files]
         
         # Trim clips if total duration exceeds max_duration
         total_duration = sum(clip.duration for clip in clips)
@@ -143,20 +147,36 @@ def process_videos(video_links: List[str], audio_path: str, output_path: str, ma
         if final_clip.duration > max_duration:
             final_clip = final_clip.subclip(0, max_duration)
         
-        # Load audio file
-        logger.info("Adding audio track...")
-        audio = AudioFileClip(audio_path)
+        # Load background audio file
+        logger.info("Adding background audio track...")
+        background_audio = AudioFileClip(audio_path)
         
-        # Loop audio if it's shorter than the video
-        if audio.duration < final_clip.duration:
-            logger.info(f"Audio ({audio.duration}s) is shorter than video ({final_clip.duration}s). Looping audio...")
-            audio = audio.fx.audio_loop(duration=final_clip.duration)
+        # Loop background audio if it's shorter than the video
+        if background_audio.duration < final_clip.duration:
+            logger.info(f"Background audio ({background_audio.duration}s) is shorter than video ({final_clip.duration}s). Looping audio...")
+            background_audio = background_audio.fx.audio_loop(duration=final_clip.duration)
         else:
-            # Trim audio if it's longer than the video
-            audio = audio.subclip(0, final_clip.duration)
+            # Trim background audio if it's longer than the video
+            background_audio = background_audio.subclip(0, final_clip.duration)
         
-        # Set audio to the concatenated video
-        final_clip = final_clip.set_audio(audio)
+        # If narration is provided, combine it with the background audio
+        if narration_path and os.path.exists(narration_path):
+            logger.info("Adding narration audio track...")
+            narration_audio = AudioFileClip(narration_path)
+            
+            # Trim narration if it's longer than the video
+            if narration_audio.duration > final_clip.duration:
+                narration_audio = narration_audio.subclip(0, final_clip.duration)
+            
+            # Adjust background audio volume to be quieter than narration
+            background_audio = background_audio.volumex(0.3)  # Reduce background volume to 30%
+            
+            # Combine background and narration audio
+            combined_audio = CompositeAudioClip([background_audio, narration_audio])
+            final_clip = final_clip.set_audio(combined_audio)
+        else:
+            # Just use background audio if no narration
+            final_clip = final_clip.set_audio(background_audio)
         
         # Write the result to a file
         logger.info(f"Writing output to {output_path}...")
@@ -219,6 +239,74 @@ async def download_video(job_id: str):
         filename=f"combined_video_{job_id}.mp4",
         media_type="video/mp4"
     )
+
+@app.post("/combine-with-narration")
+async def combine_with_narration(
+    video_links: str = Form(...),
+    audio_link: str = Form(...),
+    narration_file: UploadFile = File(...),
+    max_duration: int = Form(600),
+    background_tasks: BackgroundTasks = BackgroundTasks()
+):
+    """Combine videos with background audio and narration from an uploaded file."""
+    # Parse video links from the form string (comma-separated URLs)
+    video_links_list = [url.strip() for url in video_links.split(',') if url.strip()]
+    
+    if not video_links_list:
+        raise HTTPException(status_code=400, detail="No video links provided")
+    
+    # Generate a unique ID for this request
+    job_id = str(uuid.uuid4())
+    output_path = os.path.join(OUTPUT_DIR, f"{job_id}.mp4")
+    audio_temp_path = os.path.join(TEMP_DIR, f"{job_id}_audio.mp3")
+    narration_temp_path = os.path.join(TEMP_DIR, f"{job_id}_narration.mp3")
+    
+    # Download the background audio file from the provided link
+    try:
+        response = requests.get(audio_link, stream=True)
+        response.raise_for_status()
+        with open(audio_temp_path, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                f.write(chunk)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to download background audio: {str(e)}")
+    
+    # Save the uploaded narration file
+    try:
+        content = await narration_file.read()
+        with open(narration_temp_path, 'wb') as f:
+            f.write(content)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to process narration file: {str(e)}")
+    
+    try:
+        process_videos(
+            video_links_list,
+            audio_temp_path,
+            output_path,
+            max_duration,
+            narration_temp_path
+        )
+        
+        # Schedule cleanup of temporary files
+        background_tasks.add_task(os.remove, output_path)
+        background_tasks.add_task(os.remove, audio_temp_path)
+        background_tasks.add_task(os.remove, narration_temp_path)
+        
+        return FileResponse(
+            path=output_path,
+            filename=f"combined_video_{job_id}.mp4",
+            media_type="video/mp4"
+        )
+    except Exception as e:
+        # Clean up files if an error occurs
+        for path in [output_path, audio_temp_path, narration_temp_path]:
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                except:
+                    pass
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     import uvicorn
