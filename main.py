@@ -29,44 +29,69 @@ class VideoRequest(BaseModel):
     audio_link: HttpUrl
     max_duration: int = 600  # 10 minutes in seconds
 
+from fastapi import UploadFile, Form
+import json
+
 @app.post("/combine-videos")
-async def combine_videos(request: VideoRequest):
-    # Generate a unique ID for this request
+async def combine_videos(
+    video_links: str = Form(...),
+    max_duration: int = Form(600),
+    audio: UploadFile = File(...),
+    background_tasks: BackgroundTasks = None
+):
+    # Parse video_links from JSON string
+    try:
+        video_links_list = json.loads(video_links)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid video_links format: {str(e)}")
+
+    # Save uploaded audio file to temp directory
     job_id = str(uuid.uuid4())
     output_path = os.path.join(OUTPUT_DIR, f"{job_id}.mp4")
-    
-    # Process videos synchronously
+    audio_path = os.path.join(TEMP_DIR, f"{job_id}_audio_{audio.filename}")
+    with open(audio_path, "wb") as f:
+        f.write(await audio.read())
+
     try:
         process_videos(
-            request.video_links, 
-            request.audio_link, 
-            output_path, 
-            request.max_duration
+            video_links_list,
+            audio_path,
+            output_path,
+            max_duration
         )
-        
-        # Return the video file directly
+        background_tasks.add_task(os.remove, output_path)
+        background_tasks.add_task(os.remove, audio_path)
         return FileResponse(
             path=output_path,
             filename=f"combined_video_{job_id}.mp4",
             media_type="video/mp4"
         )
     except Exception as e:
-        # Clean up if there was an error
         if os.path.exists(output_path):
             try:
                 os.remove(output_path)
             except:
                 pass
+        if os.path.exists(audio_path):
+            try:
+                os.remove(audio_path)
+            except:
+                pass
         raise HTTPException(status_code=500, detail=str(e))
 
-def download_file(url: str, directory: str) -> str:
+def download_file(url, directory: str) -> str:
     """Download a file from a URL and save it to the specified directory."""
     try:
-        # Generate a unique filename
-        filename = os.path.join(directory, f"{uuid.uuid4()}{os.path.splitext(url.split('/')[-1])[1] if '.' in url.split('/')[-1] else '.mp4'}")
+        # Convert Pydantic URL object to string if needed
+        url_str = str(url)
+        
+        # Generate a unique filename with proper extension
+        url_path = url_str.split('/')[-1] if '/' in url_str else ''
+        extension = os.path.splitext(url_path)[1] if '.' in url_path else '.mp4'
+        filename = os.path.join(directory, f"{uuid.uuid4()}{extension}")
         
         # Download the file
-        response = requests.get(url, stream=True)
+        response = requests.get(url_str, stream=True)
         response.raise_for_status()
         
         with open(filename, 'wb') as f:
@@ -78,7 +103,7 @@ def download_file(url: str, directory: str) -> str:
         logger.error(f"Error downloading file from {url}: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error downloading file: {str(e)}")
 
-def process_videos(video_links: List[str], audio_link: str, output_path: str, max_duration: int = 600):
+def process_videos(video_links: List[str], audio_path: str, output_path: str, max_duration: int = 600):
     """Process videos and audio to create a combined video with a maximum duration."""
     temp_dir = tempfile.mkdtemp(dir=TEMP_DIR)
     downloaded_files = []
@@ -89,10 +114,9 @@ def process_videos(video_links: List[str], audio_link: str, output_path: str, ma
         video_files = [download_file(url, temp_dir) for url in video_links]
         downloaded_files.extend(video_files)
         
-        # Download audio file
-        logger.info(f"Downloading audio file from {audio_link}...")
-        audio_file = download_file(audio_link, temp_dir)
-        downloaded_files.append(audio_file)
+        # Use uploaded audio file
+        logger.info(f"Using uploaded audio file: {audio_path}")
+        audio = AudioFileClip(audio_path)
         
         # Load video clips
         logger.info("Loading video clips...")
